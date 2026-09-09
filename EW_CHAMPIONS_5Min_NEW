@@ -1,0 +1,382 @@
+//+------------------------------------------------------------------------+
+//|                                   EW_AutoUnlock_AllSymbols_Final.mq5   |
+//| แนวคิด : สแกน Elliott Wave แข่งขัน + ปลดล็อคกวาดทุกตลาดอัตโนมัติเมื่อทุนถึง $200 |
+//| แก้ไข: เคลียร์ปัญหาไวยากรณ์ส่งค่าอาเรย์อินดิเคเตอร์ buf[0] เรียบร้อยแล้ว  |
+//+------------------------------------------------------------------------+
+#property copyright "Custom EA - Elliott Wave All Symbols Auto-Unlock"
+#property version   "3.31"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//====================================================================
+// INPUTS
+//====================================================================
+input group "=== 🔒 รายชื่อสินทรัพย์แยกตามโหมดทุน ==="
+input string InpBaseSymbols       = "EURUSD,GBPUSD,USDJPY"; // สินทรัพย์หลักช่วงทุน $100 (สเปรดต่ำ คุม Drawdown)
+input int    InpTimerSeconds      = 30;         // ความถี่ในการสแกน (วินาที)
+
+input group "=== พารามิเตอร์ Elliott Wave / Fibonacci ==="
+input int    InpSwingStrength     = 3;          // จำนวนแท่งซ้าย-ขวาที่ใช้ยืนยัน Swing High/Low
+input int    InpLookbackBars      = 300;        // จำนวนแท่งย้อนหลังที่ใช้หา Pivot
+input double InpMinImpulseATRMul  = 3.5;        // กรอง Noise
+input double InpWave2FibMin       = 0.382;      // โซน Fibo ต่ำสุด
+input double InpWave2FibMax       = 0.786;      // โซน Fibo สูงสุด
+
+input group "=== 🚨 ระบบคุมความเสี่ยงและการแข่งขัน ==="
+input double InpTargetMilestoneUSD = 200.00;    // เป้าหมายการปลดล็อคสินทรัพย์ทั้งหมด ($200)
+input double InpBaseMaxSLUSD       = 3.00;      // ขาดทุนสูงสุดตอนเริ่มต้น $3.00 ต่อไม้ (3% ของทุน $100)
+input double InpMinRRRatio         = 3.0;       // ล็อค R:R ขั้นต่ำ 1:3 เท่านั้นกินคำใหญ่
+input double InpSLBufferATRMul     = 0.6;       
+input int    InpATRPeriod         = 14;        
+input int    InpMaxOpenPositions  = 2;          // จำกัดไม้เปิดพร้อมกันสูงสุด 2 ไม้เพื่อเซฟพอร์ต
+input int    InpMaxSpreadPoints   = 25;         // สเปรดสูงสุดสำหรับคู่เงินหลัก (2.5 pips)
+input bool   InpUseBreakEven      = true;      
+input double InpBreakEvenATRMul   = 1.0;       
+input ulong  InpMagicNumber       = 20260910;  
+
+input group "=== 🎨 การตั้งค่าการแสดงผลกราฟิก ==="
+input color  InpLineColorBullish   = clrLimeGreen; 
+input color  InpLineColorBearish   = clrCrimson;   
+input int    InpLineWidth          = 2;            
+
+input group "=== 📱 ระบบแจ้งเตือนมือถือ ==="
+input bool   InpUsePushNotification = true;     // เปิด/ปิด แจ้งเตือนเข้าสมาร์ทโฟน
+
+//====================================================================
+// STRUCTS / GLOBALS
+//====================================================================
+struct PivotPoint { datetime time; double price; bool isHigh; };
+struct SymState { string symbol; datetime lastBarTime; int atrHandle; };
+
+SymState       g_symbols[];
+CTrade         trade;
+CPositionInfo  posInfo;
+bool           g_isAdvancedUnlocked = false;   
+
+// ประกาศฟังก์ชันล่วงหน้า (Forward Declarations)
+void RefreshSymbolBasket(bool unlockAll);
+void ReleaseAllATRHandles();
+double GetATRValue(int idx, string symbol);
+int FindSymbolIndex(string symbol);
+int FindPivots(string symbol, int lookback, int strength, PivotPoint &pivots[]);
+void DrawWaveVisuals(PivotPoint &pivots[]);
+void CheckAndApplyBreakEven();
+bool ValidateOrderRisk(string symbol, double lot, double riskDistance, double allowedRiskMoney);
+void ProcessTradingLogic(int symIdx, string symbol, PivotPoint &pivots[], double atr, double allowedRisk);
+int CountPositions(string symbol = "");
+
+//====================================================================
+// INITIALIZATION
+//====================================================================
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   RefreshSymbolBasket(false); // เริ่มต้นรันโหมดปลอดภัยด้วยกลุ่มคู่เงินหลักก่อน
+   
+   if(InpUsePushNotification)
+   {
+      SendNotification("🤖 บอทพร้อมรบสนามแข่ง v3.31! ล็อคเป้าหมายสะสมกำไรสู่ $200 เพื่อปลดล็อคทุกตลาดอัตโนมัติค่ะ");
+   }
+   
+   EventSetTimer(InpTimerSeconds);
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason) 
+{ 
+   EventKillTimer(); 
+   ObjectsDeleteAll(0, "EW_"); 
+   ReleaseAllATRHandles(); 
+}
+
+//====================================================================
+// MAIN TIMER LOOP
+//====================================================================
+void OnTimer()
+{
+   CheckAndApplyBreakEven();
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   if(balance >= InpTargetMilestoneUSD)
+   {
+      if(!g_isAdvancedUnlocked)
+      {
+         g_isAdvancedUnlocked = true;
+         RefreshSymbolBasket(true); // สั่งเปิดกลไกกวาดระบบสินทรัพย์ทั้งหมดทั่วทั้งโบรกเกอร์
+         if(InpUsePushNotification)
+         {
+            SendNotification(StringFormat("🎉 [ALL-ASSETS UNLOCKED] พอร์ตทะลุ $%.2f ระบบเปิดใช้งานโหมดสแกนกวาดทุกสัญลักษณ์ในโบรกเกอร์แล้วค่ะ!", balance));
+         }
+      }
+   }
+   else
+   {
+      if(g_isAdvancedUnlocked)
+      {
+         g_isAdvancedUnlocked = false;
+         RefreshSymbolBasket(false); // ถอยระบบกลับมาเล่นเฉพาะกลุ่มสกุลเงินหลักที่สเปรดต่ำปลอดภัย
+         if(InpUsePushNotification)
+         {
+            SendNotification("⚠️ [DEFENSIVE FALLBACK] เงินทุนต่ำกว่า $200 ระบบปิดสิทธิ์สินทรัพย์เสี่ยงเพื่อป้องกัน Drawdown แล้วค่ะ");
+         }
+      }
+   }
+
+   if(CountPositions() >= InpMaxOpenPositions)
+   {
+      return;
+   }
+
+   double allowedRisk = (balance >= InpTargetMilestoneUSD) ? (InpBaseMaxSLUSD * 2.0) : InpBaseMaxSLUSD; 
+
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+   {
+      string currentSym = g_symbols[i].symbol;
+      if(SymbolInfoInteger(currentSym, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL || !SymbolInfoInteger(currentSym, SYMBOL_VISIBLE))
+      {
+         continue;
+      }
+
+      double atr = GetATRValue(i, currentSym);
+      if(atr <= 0)
+      {
+         continue;
+      }
+
+      int maxSpread = InpMaxSpreadPoints;
+      if(StringFind(currentSym, "XAU") >= 0 || StringFind(currentSym, "XAG") >= 0 || StringFind(currentSym, "WTI") >= 0 || StringFind(currentSym, "OIL") >= 0 || StringFind(currentSym, "COPPER") >= 0)
+      {
+         maxSpread = 50; // โลหะ/น้ำมัน ยอมรับสเปรดดึงได้ถึง 5.0 Pips
+      }
+      else if(SymbolInfoInteger(currentSym, SYMBOL_DIGITS) == 2) 
+      {
+         maxSpread = 60; // หุ้นยักษ์ใหญ่สหรัฐฯ ยอมรับได้ถึง 6.0 Pips
+      }
+
+      if((int)SymbolInfoInteger(currentSym, SYMBOL_SPREAD) > maxSpread)
+      {
+         continue;
+      }
+
+      PivotPoint pivots[];
+      int pivotCount = FindPivots(currentSym, InpLookbackBars, InpSwingStrength, pivots);
+      if(pivotCount < 5)
+      {
+         continue; 
+      }
+
+      if(currentSym == _Symbol)
+      {
+         DrawWaveVisuals(pivots);
+      }
+      
+      ProcessTradingLogic(i, currentSym, pivots, atr, allowedRisk);
+   }
+}
+
+//====================================================================
+// DYNAMIC REFRESH BASKET LOGIC
+//====================================================================
+void RefreshSymbolBasket(bool unlockAll)
+{
+   ReleaseAllATRHandles();
+   
+   if(!unlockAll)
+   {
+      string parts[];
+      int n = StringSplit(InpBaseSymbols, ',', parts);
+      ArrayResize(g_symbols, n);
+      for(int i = 0; i < n; i++)
+      {
+         string s = parts[i];
+         StringTrimLeft(s); StringTrimRight(s);
+         g_symbols[i].symbol = s;
+         g_symbols[i].lastBarTime = 0;
+         SymbolSelect(s, true);
+         g_symbols[i].atrHandle = iATR(s, PERIOD_M5, InpATRPeriod);
+      }
+      Print("🔄 [BASKET] โหมดปลอดภัย รันเฉพาะสกุลเงินหลัก: ", InpBaseSymbols);
+   }
+   else
+   {
+      int totalSymbols = SymbolsTotal(false); 
+      int activeCount = 0;
+      ArrayResize(g_symbols, 0);
+      
+      for(int i = 0; i < totalSymbols; i++)
+      {
+         string name = SymbolName(i, false);
+         
+         if(SymbolInfoInteger(name, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_FULL)
+         {
+            activeCount++;
+            ArrayResize(g_symbols, activeCount);
+            g_symbols[activeCount - 1].symbol = name;
+            g_symbols[activeCount - 1].lastBarTime = 0;
+            SymbolSelect(name, true); 
+            g_symbols[activeCount - 1].atrHandle = iATR(name, PERIOD_M5, InpATRPeriod);
+         }
+      }
+      Print("🔄 [ALL-ASSETS BASKET ENROLLED] ดึงรายการเข้าเรดาร์สำเร็จ: ", activeCount, " สัญลักษณ์");
+   }
+}
+
+void ReleaseAllATRHandles()
+{
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+   {
+      if(g_symbols[i].atrHandle != INVALID_HANDLE) 
+      { 
+         IndicatorRelease(g_symbols[i].atrHandle); 
+         g_symbols[i].atrHandle = INVALID_HANDLE; 
+      }
+   }
+}
+
+//====================================================================
+// CORE FUNCTIONS
+//====================================================================
+int FindPivots(string symbol, int lookback, int strength, PivotPoint &pivots[]) 
+{ 
+   MqlRates rates[]; 
+   int copied = CopyRates(symbol, PERIOD_M5, 1, lookback, rates); 
+   if(copied < (2 * strength + 1)) return 0; 
+   ArraySetAsSeries(rates, true); ArrayResize(pivots, 0); 
+   for(int i = strength; i < copied - strength; i++) 
+   { 
+      bool isHigh = true; bool isLow = true; 
+      for(int j = 1; j <= strength; j++) 
+      { 
+         if(rates[i].high <= rates[i + j].high || rates[i].high <= rates[i - j].high) isHigh = false; 
+         if(rates[i].low >= rates[i + j].low || rates[i].low >= rates[i - j].low) isLow = false; 
+      } 
+      if(isHigh || isLow) 
+      { 
+         int newSize = ArraySize(pivots) + 1; ArrayResize(pivots, newSize); 
+         pivots[newSize - 1].time = rates[i].time; pivots[newSize - 1].price = isHigh ? rates[i].high : rates[i].low; pivots[newSize - 1].isHigh = isHigh; 
+      } 
+   } 
+   int total = ArraySize(pivots); 
+   for(int i = 0; i < total / 2; i++) { PivotPoint temp = pivots[i]; pivots[i] = pivots[total - 1 - i]; pivots[total - 1 - i] = temp; } 
+   return total; 
+}
+
+void DrawWaveVisuals(PivotPoint &pivots[]) 
+{ 
+int total = ArraySize(pivots); if(total < 4) return; 
+ObjectsDeleteAll(0, "EW_Line_"); ObjectsDeleteAll(0, "EW_Text_");
+for(int i = total - 4; i < total - 1; i++)
+{
+string ln = "EW_Line_" + IntegerToString(i); ObjectCreate(0, ln, OBJ_TREND, 0,
+pivots[i].time, pivots[i].price, pivots[i+1].time, pivots[i+1].price);
+color wc = (pivots[i+1].price > pivots[i].price) ? InpLineColorBullish : InpLineColorBearish;
+ObjectSetInteger(0, ln, OBJPROP_COLOR, wc); ObjectSetInteger(0, ln,
+OBJPROP_WIDTH, InpLineWidth); ObjectSetInteger(0, ln, OBJPROP_RAY_RIGHT, false);
+string tx = "EW_Text_" + IntegerToString(i); ObjectCreate(0, tx, OBJ_TEXT, 0, pivots[i].time,
+pivots[i].price);
+ObjectSetString(0, tx, OBJPROP_TEXT, "P" + IntegerToString(total - i - 1));
+ObjectSetInteger(0, tx, OBJPROP_COLOR, clrWhite);
+}
+}
+
+void ProcessTradingLogic(int symIdx, string symbol, PivotPoint &pivots[], double atr, double allowedRisk)
+{
+int total = ArraySize(pivots); if(total < 4) return;
+PivotPoint p4 = pivots[total - 1]; PivotPoint p3 = pivots[total - 2]; PivotPoint p2 = pivots[total -
+3]; PivotPoint p1 = pivots[total - 4];
+if(!p1.isHigh && p2.isHigh && !p3.isHigh && p4.isHigh) {
+double w1 = p2.price - p1.price;
+if(w1 > (InpMinImpulseATRMul * atr)) {
+double ret = (p2.price - p3.price) / w1;
+if(ret >= InpWave2FibMin && ret <= InpWave2FibMax && CountPositions(symbol) == 0) {
+double ask = SymbolInfoDouble(symbol, SYMBOL_ASK), sl = p3.price -
+(InpSLBufferATRMul * atr), tp = p3.price + (w1 * 1.618);
+if((ask - sl > 0) && ((tp - ask) / (ask - sl) >= InpMinRRRatio)) {
+double lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+if(lot > 0 && ValidateOrderRisk(symbol, lot, ask - sl, allowedRisk))
+if(trade.Buy(lot, symbol, ask, sl, tp, "Auto_W3_B") && InpUsePushNotification)
+SendNotification(StringFormat("🚀 [BUY] %s", symbol));
+}
+}
+}
+}
+if(p1.isHigh && !p2.isHigh && p3.isHigh && !p4.isHigh) {
+double w1 = p1.price - p2.price;
+if(w1 > (InpMinImpulseATRMul * atr)) {
+double ret = (p3.price - p2.price) / w1;
+if(ret >= InpWave2FibMin && ret <= InpWave2FibMax && CountPositions(symbol) == 0) {
+double bid = SymbolInfoDouble(symbol, SYMBOL_BID), sl = p3.price +
+(InpSLBufferATRMul * atr), tp = p3.price - (w1 * 1.618);
+if((sl - bid > 0) && ((bid - tp) / (sl - bid) >= InpMinRRRatio)) {
+double lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+if(lot > 0 && ValidateOrderRisk(symbol, lot, sl - bid, allowedRisk))
+if(trade.Sell(lot, symbol, bid, sl, tp, "Auto_W3_S") && InpUsePushNotification)
+SendNotification(StringFormat("🚀 [SELL] %s", symbol));
+}
+}
+}
+}
+}
+
+//====================================================================
+// MANAGEMENT & UTILITIES
+//====================================================================
+bool ValidateOrderRisk(string symbol, double lot, double riskDistance, double allowedRiskMoney) 
+{
+   double tv = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(ts <= 0 || tv <= 0) return false; 
+   return ((riskDistance / ts) * tv * lot <= allowedRiskMoney);
+}
+
+void CheckAndApplyBreakEven() 
+{
+   if(!InpUseBreakEven) return;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) 
+   {
+      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != InpMagicNumber) continue;
+      string s = posInfo.Symbol(); 
+      int idx = FindSymbolIndex(s); 
+      if(idx == -1) continue;
+      double atr = GetATRValue(idx, s);
+      double cp = posInfo.PriceCurrent();
+      double op = posInfo.PriceOpen();
+      double sl = posInfo.StopLoss();
+      double buf = 5.0 * SymbolInfoDouble(s, SYMBOL_POINT);
+      if(atr <= 0) continue;
+      if(posInfo.PositionType() == POSITION_TYPE_BUY && (cp - op) >= (InpBreakEvenATRMul * atr) && (sl < op || sl == 0)) 
+         trade.PositionModify(posInfo.Ticket(), op + buf, posInfo.TakeProfit());
+      if(posInfo.PositionType() == POSITION_TYPE_SELL && (op - cp) >= (InpBreakEvenATRMul * atr) && (sl > op || sl == 0)) 
+         trade.PositionModify(posInfo.Ticket(), op - buf, posInfo.TakeProfit());
+   }
+}
+
+int FindSymbolIndex(string symbol) 
+{ 
+   for(int i = 0; i < ArraySize(g_symbols); i++) 
+   { 
+      if(g_symbols[i].symbol == symbol) return i; 
+   } 
+   return -1; 
+}
+
+double GetATRValue(int idx, string symbol) 
+{
+   if(g_symbols[idx].atrHandle == INVALID_HANDLE) return 0;
+   double buf[]; 
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(g_symbols[idx].atrHandle, 0, 1, 1, buf) <= 0) return 0;
+   return buf[0]; // [แก้ไขเสร็จสิ้น] ระบุเลข 0 ดึงค่าแท่งปัจจุบัน เคลียร์บั๊ก Invalid array access ถาวร
+}
+
+int CountPositions(string symbol = "") 
+{
+   int cnt = 0; 
+   for(int i = PositionsTotal() - 1; i >= 0; i--) 
+   {
+      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != InpMagicNumber) continue; 
+      if(symbol == "" || posInfo.Symbol() == symbol) cnt++;
+   }
+   return cnt;
+}
